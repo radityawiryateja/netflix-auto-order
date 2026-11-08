@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]
+supabase
+httpx
+qrcode
+Pillow
+python-dotenv
