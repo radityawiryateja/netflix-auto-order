@@ -926,12 +926,15 @@ async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, origi
 # ORDER LIFECYCLE
 # ============================================================
 def delivery_text(o: dict) -> str:
+    is_direct = o["id"].startswith("DIR")
+    
     lines = [
         T("delivery_head"),
         "",
     ]
+    
     # Sembunyikan baris ID Order jika order hasil generate manual (DIR)
-    if not o["id"].startswith("DIR"):
+    if not is_direct:
         lines.append(T("delivery_order", order=o["id"]))
         
     lines.append(T("delivery_produk", produk=f"{h(o['app_name'])} {h(o['label'])} ({h(o['duration_code'])})"))
@@ -946,9 +949,16 @@ def delivery_text(o: dict) -> str:
     if o.get("profile_pin"):
         lines.append(T("delivery_pin", pin=h(o["profile_pin"])))
     lines.append("")
-    if o.get("need_otp"):
-        lines.append(T("otp_hint"))
-    lines.append(T("delivery_foot"))
+    
+    if is_direct:
+        # Khusus /paid: Tampilkan S&K, sembunyikan petunjuk login & penutup
+        lines.append(T("tos"))
+    else:
+        # Order Reguler: Tampilkan petunjuk OTP & penutup
+        if o.get("need_otp"):
+            lines.append(T("otp_hint"))
+        lines.append(T("delivery_foot"))
+        
     return "\n".join(lines)
 
 
@@ -1564,34 +1574,46 @@ async def job_payments(context: ContextTypes.DEFAULT_TYPE):
 async def job_rentals(context: ContextTypes.DEFAULT_TYPE):
     bot, t = context.bot, now()
     try:
+        # PERBAIKAN: Masukkan status "gift" untuk dicek masa berlakunya
         ended = await dbx(
-            sb.table("orders").select("*").eq("status", "success").lte("expires_at", iso(t))
+            sb.table("orders").select("*").in_("status", ["success", "gift"]).lte("expires_at", iso(t))
         )
         for o in ended:
             rows = await dbx(
                 sb.table("orders")
                 .update({"status": "finished"})
                 .eq("id", o["id"])
-                .eq("status", "success")
+                .in_("status", ["success", "gift"])
             )
             if not rows:
                 continue
             await release_slot(o["slot_key"])
-            try:
-                await bot.send_message(
-                    o["tg_user_id"],
-                    T("expired", produk=f"{h(o['app_name'])} {h(o['label'])}", order=o["id"]),
-                    parse_mode=ParseMode.HTML,
+            
+            # Pisahkan notifikasi: order biasa ke buyer, order gift(expired) ke admin
+            if o["status"] == "success":
+                try:
+                    await bot.send_message(
+                        o["tg_user_id"],
+                        T("expired", produk=f"{h(o['app_name'])} {h(o['label'])}", order=o["id"]),
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                await notify_admin(
+                    bot,
+                    f"⌛ <b>SEWA BERAKHIR</b> | <code>{o['id']}</code>\n"
+                    f"{h(o['app_name'])} {h(o['label'])} — slot <code>{h(o['email'])}</code> "
+                    f"{h(o.get('profile_name') or '')} tersedia kembali.",
                 )
-            except Exception:
-                pass
-            await notify_admin(
-                bot,
-                f"⌛ <b>SEWA BERAKHIR</b> | <code>{o['id']}</code>\n"
-                f"{h(o['app_name'])} {h(o['label'])} — slot <code>{h(o['email'])}</code> "
-                f"{h(o.get('profile_name') or '')} tersedia kembali.",
-            )
+            elif o["status"] == "gift":
+                await notify_admin(
+                    bot,
+                    f"🗑 <b>GIFT KADALUARSA</b> | <code>{o['id']}</code>\n"
+                    f"{h(o['app_name'])} {h(o['label'])} — slot <code>{h(o['email'])}</code> "
+                    f"{h(o.get('profile_name') or '')} tidak ada yang klaim hingga durasi sewa habis. Slot tersedia kembali."
+                )
 
+        # Reminder akan habis (khusus order success)
         soon = await dbx(
             sb.table("orders")
             .select("*")
@@ -1661,6 +1683,42 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     await update.message.reply_text(ADMIN_HELP, parse_mode=ParseMode.HTML, reply_markup=admin_menu_markup())
+
+async def cmd_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ <b>Format Salah</b>\nGunakan: <code>/cek email@gmail.com</code>", 
+            parse_mode=ParseMode.HTML
+        )
+    
+    email = context.args[0].lower()
+    rows = await dbx(
+        sb.table("stocks")
+        .select("id, status, label, duration_code, price, profile_name, apps(name)")
+        .eq("email", email)
+        .order("id")
+    )
+    
+    if not rows:
+        return await update.message.reply_text(
+            f"❌ Tidak ada stok untuk email <b>{h(email)}</b>", 
+            parse_mode=ParseMode.HTML
+        )
+    
+    lines = [f"🔍 <b>Stok untuk:</b> <code>{h(email)}</code>\n"]
+    icon = {"available": "🟢", "held": "🟡", "rented": "🔴"}
+    
+    for s in rows:
+        prof = f" | 👤 {h(s['profile_name'])}" if s.get("profile_name") else ""
+        lines.append(
+            f"{icon.get(s['status'], '⚪')} <code>#{s['id']}</code> {h(s['apps']['name'])} {h(s['label'])} "
+            f"({h(s['duration_code'])}) - {rp(s['price'])}{prof}"
+        )
+        
+    lines.append("\n🟢 tersedia  🟡 di-hold  🔴 disewa")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 async def cmd_bc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -2353,10 +2411,13 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines = ["🧾 <b>Transaksi Aktif</b>\n"]
         for o in rows:
             ico = "🕐" if o["status"] == "pending" else "🔴"
-            tail = f"habis {fmt_dt(o['expires_at'])}" if o["status"] == "success" else f"bayar sebelum {fmt_dt(o['hold_until'])}"
+            tail = f"habis {fmt_dt(o['expires_at'])}" if o["status"] == "success" else f"bayar s/d {fmt_dt(o['hold_until'])}"
+            prof = f" | 👤 {h(o['profile_name'])}" if o.get("profile_name") else ""
+            
             lines.append(
-                f"{ico} <code>{o['id']}</code> {h(o['app_name'])} {h(o['label'])} {rp(o['price'])}\n"
-                f"    @{h(o.get('tg_username') or '-')} | {tail}"
+                f"{ico} <b>{h(o['app_name'])} {h(o['label'])}</b> {rp(o['price'])}\n"
+                f"    📧 <code>{h(o['email'])}</code>{prof}\n"
+                f"    👤 @{h(o.get('tg_username') or '-')} | {tail}"
             )
         if not rows:
             lines.append("Tidak ada transaksi aktif.")
@@ -2399,6 +2460,7 @@ async def main():
     app.add_handler(CommandHandler("give", cmd_give, filters=private))
     app.add_handler(CommandHandler("bc", cmd_bc, filters=private))
     app.add_handler(CommandHandler("ppj", cmd_ppj, filters=private))
+    app.add_handler(CommandHandler("cek", cmd_cek, filters=private))
 
     app.add_handler(CallbackQueryHandler(cb_offer, pattern=r"^o:\d+$"))
     app.add_handler(CallbackQueryHandler(cb_tos, pattern=r"^tos:\d+$"))
