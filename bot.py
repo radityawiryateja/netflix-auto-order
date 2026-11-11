@@ -71,6 +71,11 @@ OTP_DONE_SEC = 30
 PAGE_SIZE = 8
 ACTIVE_OTP_LOCKS: dict[str, datetime] = {}
 
+# ----- Siklus PPJ Netflix (21 hari aktif + 7 hari tenggang) -----
+PPJ_CYCLE_DAYS = 28       # 21 aktif + 7 tenggang (kadang 21+6)
+PPJ_ALERT_DAY = 27        # alert ke owner mulai hari ke-27
+PPJ_STOP_ALERT_DAY = 35   # berhenti spam kalau akun memang sudah ditinggalkan
+
 TOS_TEXT = (
     "📜 <b>Syarat & Ketentuan</b>\n"
     "1. Akun adalah <b>sharing/sewa</b>, dilarang mengubah email, password, PIN & profil.\n"
@@ -697,7 +702,6 @@ async def create_payment(order: dict):
                         qris_url = a["url"]
                         break
                 
-                # Perhatikan tambahan order["price"] di bagian akhir return
                 if data.get("qr_string"):
                     return make_qr_png(data["qr_string"]), data.get("transaction_id", ""), qris_url, order["price"]
                 if qris_url:
@@ -716,7 +720,7 @@ async def create_payment(order: dict):
     elif PROVIDER == "meldapay":
         return await create_meldapay_invoice(order)
 
-    # Return untuk metode manual (tambahkan order["price"])
+    # Return untuk metode manual
     if os.path.exists(QRIS_IMAGE_PATH):
         with open(QRIS_IMAGE_PATH, "rb") as f:
             return f.read(), "manual", None, order["price"]
@@ -758,12 +762,9 @@ async def create_meldapay_invoice(order: dict):
         invoice_id = data["invoice_id"]
         qris_url = data.get("payment_link")
         
-        # Ambil total tagihan (sudah termasuk fee/kode unik dari Meldapay)
         final_price = data.get("total", order["price"])
         
-        # Unduh gambar QRIS dari Meldapay
         img_resp = await c.get(data["qris_image"])
-        # Return 4 variabel
         return img_resp.content, f"melda:{invoice_id}", qris_url, final_price
 
 async def meldapay_status(invoice_id: str) -> str:
@@ -810,7 +811,6 @@ def _body_text(msg) -> str:
 
 
 def _extract_code(text: str, device: str = "hp") -> str | None:
-    # Logika untuk TV (link atau 8 digit alfanumerik)
     if device == "tv":
         links = re.findall(r"https?://[^\s\"'<>]+", text)
         for link in links:
@@ -820,17 +820,14 @@ def _extract_code(text: str, device: str = "hp") -> str | None:
         for m in re.finditer(r"(?<![\w-])([a-zA-Z0-9]{8})(?![\w-])", text):
             return m.group(1)
 
-    # Logika untuk HP/Laptop (STRICT 4 digit angka)
     text = re.sub(r"https?://\S+", " ", text)
     for marker in ("SRC:", "Ada pertanyaan", "Questions?", "Netflix Pte"):
         i = text.find(marker)
         if i > 0:
             text = text[:i]
             
-    # Regex \d{4} memastikan HANYA mengambil angka yang panjangnya pas 4 digit
     for m in re.finditer(r"(?<![\w-])(\d{4})(?![\w-])", text):
         c = m.group(1)
-        # Abaikan jika terlihat seperti tahun kalender
         if c[:2] in ("19", "20"):
             continue
         return c
@@ -857,7 +854,6 @@ def fetch_otp_sync(mail_user: str, app_password: str, since_dt: datetime, device
             except Exception:
                 pass
             subject = str(make_header(decode_header(msg.get("Subject", ""))))
-            # Tambahkan argumen device ke _extract_code
             code = _extract_code(subject, device) or _extract_code(_body_text(msg), device)
             if code:
                 return code
@@ -869,7 +865,6 @@ def fetch_otp_sync(mail_user: str, app_password: str, since_dt: datetime, device
             pass
 
 
-# Tambahkan argumen device="hp" di parameternya
 async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, original_msg, status_msg, device: str = "hp"):
     email = order["email"]
     oid = order["id"]
@@ -880,7 +875,6 @@ async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, origi
         mins, secs = divmod(int(time_left.total_seconds()), 60)
         timer_str = f"{mins:02d}:{secs:02d}"
         
-        # Bedakan pesan live berdasarkan device
         device_name = "TV 📺" if device == "tv" else "HP/Laptop 📱"
         live_text = f"⏳ <b>Menunggu Kode {device_name} ({timer_str})</b>\n\nBot sedang memantau email secara live..."
         
@@ -895,7 +889,6 @@ async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, origi
             pass
             
         try:
-            # Teruskan parameter device ke fetch_otp_sync
             code = await asyncio.to_thread(fetch_otp_sync, email, app_pw, since_dt, device)
         except Exception as e:
             logger.error(f"Error saat polling OTP: {e}")
@@ -917,7 +910,6 @@ async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, origi
                         parse_mode=ParseMode.HTML,
                     )
                     
-                    # Jika yang didapat berupa link (awalan http), sesuaikan kalimatnya
                     if code.startswith("http"):
                         success_msg = f"✅ <b>Link Konfirmasi Didapatkan!</b>\n\n🔗 Klik link berikut untuk masuk: \n{code}\n\n<i>Kesempatan 1x sudah terpakai.</i>"
                     else:
@@ -972,7 +964,6 @@ def delivery_text(o: dict) -> str:
         "",
     ]
     
-    # Sembunyikan baris ID Order jika order hasil generate manual (DIR)
     if not is_direct:
         lines.append(T("delivery_order", order=o["id"]))
         
@@ -990,10 +981,8 @@ def delivery_text(o: dict) -> str:
     lines.append("")
     
     if is_direct:
-        # Khusus /paid: Tampilkan S&K, sembunyikan petunjuk login & penutup
         lines.append(T("tos"))
     else:
-        # Order Reguler: Tampilkan petunjuk OTP & penutup
         if o.get("need_otp"):
             lines.append(T("otp_hint"))
         lines.append(T("delivery_foot"))
@@ -1054,7 +1043,6 @@ async def finalize_paid(bot, oid: str):
         f"Berakhir: {fmt_dt(o['expires_at'])}",
     )
 
-    # -------- TAMBAHKAN BLOK INI --------
     if HISTORY_CHANNEL_ID:
         try:
             raw_name = o.get('tg_name') or "-"
@@ -1125,7 +1113,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "tg_user_id": user.id,
                 "tg_username": user.username or "",
                 "tg_name": user.full_name,
-                # paid_at & expires_at TIDAK diubah, sudah diset saat /give
             }).eq("id", oid))
             await dbx(sb.table("stocks").update({"status": "rented", "held_until": None}).eq("slot_key", o["slot_key"]))
             o["tg_user_id"] = user.id
@@ -1152,78 +1139,105 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=ReplyKeyboardMarkup(rows_kb, resize_keyboard=True),
     )
 
+
+# ============================================================
+# PPJ (Netflix) – siklus 28 hari
+# ============================================================
 async def cmd_ppj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ppj email            -> PPJ baru dilakukan hari ini
+       /ppj email DD/MM/YYYY -> PPJ dilakukan di tanggal tsb"""
     if not is_owner(update):
         return
     args = context.args
-    if len(args) < 2:
+    if not args:
         return await update.message.reply_text(
-            "⚠️ <b>Format Salah</b>\nGunakan: <code>/ppj email@gmail.com DD/MM/YYYY</code>\n"
-            "Contoh: <code>/ppj netflix@gmail.com 20/11/2026</code>",
-            parse_mode=ParseMode.HTML
+            "Format:\n<code>/ppj email@gmail.com</code> (PPJ hari ini)\n"
+            "<code>/ppj email@gmail.com 05/11/2026</code> (tanggal PPJ)",
+            parse_mode=ParseMode.HTML,
         )
-    
     email = args[0].lower()
-    date_str = args[1]
-    
-    try:
-        # Konversi input DD/MM/YYYY ke UTC
-        dt = datetime.strptime(date_str, "%d/%m/%Y").replace(tzinfo=WIB).astimezone(timezone.utc)
-    except ValueError:
-        return await update.message.reply_text("❌ Format tanggal salah. Gunakan DD/MM/YYYY (contoh: 20/11/2026)")
-    
-    # Update semua slot/profil yang menggunakan email tersebut
-    rows = await dbx(sb.table("stocks").update({"ppj_date": iso(dt)}).eq("email", email))
+    start = now()
+    if len(args) > 1:
+        try:
+            start = datetime.strptime(args[1], "%d/%m/%Y").replace(tzinfo=WIB).astimezone(timezone.utc)
+        except ValueError:
+            return await update.message.reply_text("❌ Format tanggal salah. Contoh: 05/11/2026")
+
+    rows = await dbx(sb.table("stocks").update({"ppj_start": iso(start)}).eq("email", email))
     if not rows:
         return await update.message.reply_text("❌ Email tidak ditemukan di database stok.")
-    
+
+    alert = start + timedelta(days=PPJ_ALERT_DAY)
+    end = start + timedelta(days=PPJ_CYCLE_DAYS)
     await update.message.reply_text(
-        f"✅ Pengingat PPJ untuk <b>{h(email)}</b> berhasil diatur ke tanggal <b>{date_str}</b>.", 
-        parse_mode=ParseMode.HTML
+        f"✅ PPJ <b>{h(email)}</b> tercatat.\n"
+        f"📅 Mulai: {fmt_dt(start)}\n"
+        f"🔔 Alert cek: {fmt_dt(alert)}\n"
+        f"⌛ Perkiraan habis: {fmt_dt(end)}",
+        parse_mode=ParseMode.HTML,
     )
 
+
 async def job_daily_ppj(context: ContextTypes.DEFAULT_TYPE):
+    """Tiap pagi: alert akun yang sudah hari ke-27 atau lebih sejak PPJ terakhir."""
     bot = context.bot
     try:
-        t_now = now()
-        t_target = t_now + timedelta(days=3)
-        
-        # Cari stok yang ppj_date-nya 3 hari ke depan, dan tidak lebih dari 1 hari ke belakang (agar tidak spam kalau sudah telat lama)
+        t = now()
         rows = await dbx(
             sb.table("stocks")
-            .select("email, ppj_date, apps(name)")
-            .not_.is_("ppj_date", "null")
-            .lte("ppj_date", iso(t_target))
-            .gte("ppj_date", iso(t_now - timedelta(days=1)))
+            .select("id, email, ppj_start, apps(name)")
+            .not_.is_("ppj_start", "null")
+            .gte("ppj_start", iso(t - timedelta(days=PPJ_STOP_ALERT_DAY)))
+            .order("id")
         )
-        
-        if not rows:
-            return
-            
-        # Karena 1 email punya banyak slot/baris, kita kelompokkan (group by email)
-        accounts = {}
+        today = t.astimezone(WIB).date()
+        seen = {}
         for r in rows:
-            if r["email"] not in accounts:
-                accounts[r["email"]] = r
-                
-        if not accounts:
-            return
-            
-        lines = [
-            "⚠️ <b>PENGINGAT PPJ AKUN</b> ⚠️\n",
-            "Akun langganan berikut akan memasuki masa tenggang/habis dalam waktu dekat:\n"
-        ]
-        
-        for email, data in accounts.items():
-            dt = parse_dt(data["ppj_date"])
-            lines.append(f"📧 <code>{email}</code>\n📦 {data['apps']['name']} — ⏳ <b>{dt.astimezone(WIB).strftime('%d/%m/%Y')}</b>\n")
-            
-        lines.append("Harap segera diperpanjang agar slot pembeli tidak terganggu.")
-        await notify_admin(bot, "\n".join(lines))
-        
-    except Exception as e:
+            seen.setdefault(r["email"], r)  # 1 email = 1 alert
+
+        for email, r in seen.items():
+            day = (today - parse_dt(r["ppj_start"]).astimezone(WIB).date()).days
+            if day < PPJ_ALERT_DAY:
+                continue
+            kb = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("✅ Sudah PPJ (mulai hari ini)", callback_data=f"ppjok:{r['id']}")]]
+            )
+            await notify_admin(
+                bot,
+                f"⚠️ <b>CEK NETFLIX</b>\n"
+                f"📧 <code>{h(email)}</code>\n"
+                f"📦 {h(r['apps']['name'])}\n"
+                f"📆 Hari ke-<b>{day}</b> sejak PPJ ({fmt_dt(r['ppj_start'])})\n\n"
+                f"Cek apakah akun masih aktif / sudah kena tagihan. "
+                f"Kalau sudah PPJ, tekan tombol di bawah.",
+                kb,
+            )
+    except Exception:
         logger.exception("Gagal menjalankan job_daily_ppj")
 
+
+async def cb_ppj_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    if cq.from_user.id not in OWNER_IDS:
+        return await cq.answer("Khusus owner.", show_alert=True)
+    sid = int(cq.data.split(":")[1])
+    row = await dbx(sb.table("stocks").select("email").eq("id", sid))
+    if not row:
+        return await cq.answer("Stok tidak ditemukan", show_alert=True)
+    email = row[0]["email"]
+    await dbx(sb.table("stocks").update({"ppj_start": iso(now())}).eq("email", email))
+    await cq.answer("PPJ tercatat ✅")
+    await safe_edit(
+        cq,
+        f"✅ PPJ <b>{h(email)}</b> dicatat.\n"
+        f"Siklus baru mulai {fmt_dt(now())}, alert berikutnya "
+        f"{fmt_dt(now() + timedelta(days=PPJ_ALERT_DAY))}.",
+    )
+
+
+# ============================================================
+# KATALOG & PRICELIST
+# ============================================================
 async def show_pricelist(message, app: dict):
     rows = await dbx(
         sb.table("stocks")
@@ -1353,10 +1367,8 @@ async def cb_tos(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await dbx(sb.table("orders").insert(order))
         
-        # Tangkap 4 variabel sekarang
         png, ref, qris_url, final_price = await create_payment(order)
         
-        # Jika Meldapay mengembalikan nilai yang include fee, update database
         if final_price != order["price"]:
             order["price"] = final_price
             await dbx(sb.table("orders").update({"price": final_price}).eq("id", oid))
@@ -1436,9 +1448,6 @@ async def cb_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if o["otp_used"]:
         return await cq.answer(T("otp_used_alert"), show_alert=True)
 
-    # ----------------------------------------------------
-    # TAHAP 1: Jangan langsung polling, tanya device dulu
-    # ----------------------------------------------------
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📺 Login di TV (Smart TV/STB)", callback_data=f"otpsel:tv:{oid}")],
         [InlineKeyboardButton("📱 Login di HP / Laptop / Tablet", callback_data=f"otpsel:hp:{oid}")],
@@ -1452,9 +1461,6 @@ async def cb_otp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# ----------------------------------------------------
-# TAHAP 2: Handler baru saat pembeli memilih perangkat
-# ----------------------------------------------------
 async def cb_otp_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     parts = cq.data.split(":")
@@ -1466,7 +1472,6 @@ async def cb_otp_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await cq.answer(T("order_not_found"), show_alert=True)
     o = rows[0]
 
-    # Jika pilih Batal, kembalikan markup ke awal
     if device == "cancel":
         await cq.answer("Dibatalkan")
         try:
@@ -1475,7 +1480,6 @@ async def cb_otp_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # Lakukan validasi ulang sebelum memantau
     if o["otp_used"]:
         return await cq.answer(T("otp_used_alert"), show_alert=True)
 
@@ -1496,13 +1500,11 @@ async def cb_otp_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = now()
     await cq.answer(T("otp_starting"))
 
-    # Edit pesan akun, hapus tombol pilihan device supaya tidak bisa ditekan 2x
     try:
         await cq.edit_message_reply_markup(reply_markup=delivery_markup({**o, "otp_used": True}))
     except Exception:
         pass
 
-    # Beri petunjuk berbeda sesuai perangkat
     if device == "tv":
         hint_text = "⏳ <b>Menunggu Kode/Link TV Aktif (05:00)</b>\n\nSilakan masukkan email di TV, lalu pilih <b>Kirim Link/Kode ke Email</b>. Bot akan menangkap link/kode masuk otomatis."
     else:
@@ -1510,7 +1512,6 @@ async def cb_otp_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await cq.message.reply_text(hint_text, parse_mode=ParseMode.HTML)
 
-    # Jalankan polling dan teruskan informasi device
     asyncio.create_task(poll_otp_task(context.bot, o, app_pw, start_time, cq.message, status_msg, device))
 
 
@@ -1613,7 +1614,6 @@ async def job_payments(context: ContextTypes.DEFAULT_TYPE):
 async def job_rentals(context: ContextTypes.DEFAULT_TYPE):
     bot, t = context.bot, now()
     try:
-        # PERBAIKAN: Masukkan status "gift" untuk dicek masa berlakunya
         ended = await dbx(
             sb.table("orders").select("*").in_("status", ["success", "gift"]).lte("expires_at", iso(t))
         )
@@ -1628,7 +1628,6 @@ async def job_rentals(context: ContextTypes.DEFAULT_TYPE):
                 continue
             await release_slot(o["slot_key"])
             
-            # Pisahkan notifikasi: order biasa ke buyer, order gift(expired) ke admin
             if o["status"] == "success":
                 try:
                     await bot.send_message(
@@ -1652,7 +1651,6 @@ async def job_rentals(context: ContextTypes.DEFAULT_TYPE):
                     f"{h(o.get('profile_name') or '')} tidak ada yang klaim hingga durasi sewa habis. Slot tersedia kembali."
                 )
 
-        # Reminder akan habis (khusus order success)
         soon = await dbx(
             sb.table("orders")
             .select("*")
@@ -1705,18 +1703,22 @@ def admin_menu_markup() -> InlineKeyboardMarkup:
 
 ADMIN_HELP = (
     "🛠 <b>Panel Owner</b>\n\n"
-    "Perintah:\n"
-    "<code>/addapp Nama</code> — tambah aplikasi\n"
-    "<code>/delstok ID</code> — hapus stok (hanya yg tersedia)\n"
-    "<code>/disable EMAIL</code> — bekukan akun/email sementara\n"
-    "<code>/enable EMAIL</code> — aktifkan kembali akun/email\n"
-    "<code>/edit ID field nilai</code> — field: price, label, durasi, password, pin, mailpw\n"
-    "<code>/paid EMAIL</code> — list stok & keluarkan akun instan (bypass bayar)\n"
-    "<code>/extend ORDER_ID Durasi</code> — ubah jadwal expires (cth: 1D, 2J, -12H)\n"
-    "<code>/freestok ID_STOK</code> — paksa stok jadi available sekarang\n"
-    "<code>/give ID_STOK DURASI [ID_BUYER]</code> — kirim akun / buat link klaim\n"
-    "<code>/bc [pin]</code> — <b>(REPLY PESAN)</b> broadcast ke semua user\n"
-    "<code>/batal</code> — batalkan mode input"
+    "<b>Keluarkan akun</b>\n"
+    "<code>/paid 1p1u 1d</code> — ambil stok kosong (langsung dikirim)\n"
+    "<code>/paid netflix 1p1u 1d</code> — sama, tentukan aplikasi\n"
+    "<code>/paid EMAIL</code> — pilih manual dari 1 email\n"
+    "<code>/give ID_STOK DURASI [ID_BUYER]</code> — kirim / buat link klaim\n\n"
+    "<b>Netflix / PPJ</b>\n"
+    "<code>/ppj EMAIL</code> — PPJ hari ini (reset hitungan 28 hari)\n"
+    "<code>/ppj EMAIL 05/11/2026</code> — PPJ di tanggal tertentu\n"
+    "<code>/cek EMAIL</code> — lihat semua slot + status PPJ\n"
+    "<i>Alert otomatis tiap 08:00 WIB mulai hari ke-27.</i>\n\n"
+    "<b>Stok</b>\n"
+    "<code>/delstok ID</code> · <code>/edit ID field nilai</code>\n"
+    "<code>/disable EMAIL</code> · <code>/enable EMAIL</code> · <code>/freestok ID</code>\n\n"
+    "<b>Lainnya</b>\n"
+    "<code>/addapp Nama</code> · <code>/extend ORDER_ID 1D</code>\n"
+    "<code>/bc [pin]</code> (reply pesan) · <code>/batal</code>"
 )
 
 
@@ -1724,6 +1726,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
         return
     await update.message.reply_text(ADMIN_HELP, parse_mode=ParseMode.HTML, reply_markup=admin_menu_markup())
+
 
 async def cmd_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -1737,7 +1740,7 @@ async def cmd_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     email = context.args[0].lower()
     rows = await dbx(
         sb.table("stocks")
-        .select("id, status, label, duration_code, price, profile_name, apps(name)")
+        .select("id, status, label, duration_code, price, profile_name, ppj_start, apps(name)")
         .eq("email", email)
         .order("id")
     )
@@ -1759,7 +1762,15 @@ async def cmd_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     lines.append("\n🟢 tersedia  🟡 di-hold  🔴 disewa")
+
+    # Status PPJ
+    ppj = next((s["ppj_start"] for s in rows if s.get("ppj_start")), None)
+    if ppj:
+        day = (now() - parse_dt(ppj)).days
+        lines.append(f"\n📆 PPJ terakhir: {fmt_dt(ppj)} (hari ke-{day}/{PPJ_CYCLE_DAYS})")
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
 
 async def cmd_bc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -1787,7 +1798,6 @@ async def cmd_bc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for u in users:
         try:
-            # copy_message menjamin 100% format & emoji premium tersalin sempurna
             sent = await context.bot.copy_message(
                 chat_id=u["id"],
                 from_chat_id=reply_to.chat_id,
@@ -1797,12 +1807,12 @@ async def cmd_bc(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.pin_chat_message(chat_id=u["id"], message_id=sent.message_id)
                 except Exception:
-                    pass # Abaikan jika gagal pin
+                    pass
             sukses += 1
         except Exception:
             gagal += 1
             
-        await asyncio.sleep(0.05) # Rate limit protection (maks 30 pesan/detik)
+        await asyncio.sleep(0.05)
         
     await status_msg.edit_text(
         f"✅ <b>Broadcast Selesai</b>\n\n"
@@ -1810,6 +1820,7 @@ async def cmd_bc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Gagal (blokir bot): <b>{gagal}</b> user",
         parse_mode=ParseMode.HTML
     )
+
 
 async def cmd_batal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_owner(update):
@@ -1842,8 +1853,6 @@ async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     email = context.args[0].lower()
-    
-    # Ubah stok yang tersedia (available) menjadi 'disabled'
     rows = await dbx(
         sb.table("stocks")
         .update({"status": "disabled"})
@@ -1852,7 +1861,6 @@ async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     if not rows:
-        # Cek apakah emailnya ada di database tapi sedang disewa
         exist = await dbx(sb.table("stocks").select("id").eq("email", email))
         if exist:
             return await update.message.reply_text(
@@ -1878,8 +1886,6 @@ async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     email = context.args[0].lower()
-    
-    # Kembalikan stok yang 'disabled' menjadi 'available'
     rows = await dbx(
         sb.table("stocks")
         .update({"status": "available"})
@@ -1947,64 +1953,29 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Stok #{sid} diperbarui ({field}).")
 
 
-async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    if not context.args:
-        return await update.message.reply_text("Format: /paid <email_akun>\nContoh: /paid netflix1@gmail.com")
-    
-    email = context.args[0].lower()
-    
-    # Cari stok available berdasarkan email
-    rows = await dbx(
-        sb.table("stocks")
-        .select("*, apps(name)")
-        .eq("email", email)
-        .eq("status", "available")
-        .order("id")
-    )
-    
-    if not rows:
-        return await update.message.reply_text(f"❌ Tidak ada stok 'available' untuk email <b>{h(email)}</b>", parse_mode=ParseMode.HTML)
-    
-    lines = [f"📦 <b>Stok Available:</b> <code>{h(email)}</code>\nPilih profil/durasi untuk dikeluarkan instan (Bypass & tanpa Order ID):\n"]
-    kb = []
-    for r in rows:
-        prof = r.get("profile_name") or "Tanpa Profil"
-        btn_label = f"[{prof}] {r['label']} {r['duration_code']} - {rp(r['price'])}"
-        kb.append([InlineKeyboardButton(btn_label, callback_data=f"admpaid:{r['id']}")])
-    
-    kb.append([InlineKeyboardButton("❌ Batal", callback_data="ctos")])
-    
-    await update.message.reply_text(
-        "\n".join(lines), 
-        parse_mode=ParseMode.HTML, 
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+# ============================================================
+# /paid – dua mode: by email (manual pilih) dan by label+durasi
+# ============================================================
+PAID_USAGE = (
+    "Format <code>/paid</code>:\n"
+    "• <code>/paid 1p1u 1d</code> → ambil stok kosong label 1P1U durasi 1D\n"
+    "• <code>/paid netflix 1p1u 1d</code> → sama, tapi tentukan aplikasi\n"
+    "• <code>/paid email@gmail.com</code> → pilih manual dari 1 email"
+)
 
-async def cb_admin_paid_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cq = update.callback_query
-    if cq.from_user.id not in OWNER_IDS:
-        return await cq.answer("Khusus admin.", show_alert=True)
-    
-    sid = int(cq.data.split(":")[1])
-    
-    stock = await pick_and_hold(sid)
+
+async def issue_direct(bot, admin_user, sid: int):
+    """Hold stok lalu keluarkan akun instan (order DIR). Return order, atau None jika gagal."""
+    stock = await pick_and_hold(sid)  # sudah memprioritaskan akun "murni"
     if not stock:
-        return await cq.answer("❌ Stok baru saja diambil/tidak tersedia.", show_alert=True)
-    
-    await cq.answer("Mengeluarkan akun...", show_alert=False)
-    
-    # Buat Order ID prefix DIR (Direct) agar disembunyikan teksnya
+        return None
     oid = "DIR" + secrets.token_hex(4).upper()
-    now_dt = now()
-    expires_at = now_dt + timedelta(hours=stock["duration_hours"])
-    
+    t = now()
     order = {
         "id": oid,
-        "tg_user_id": cq.from_user.id,
-        "tg_username": cq.from_user.username,
-        "tg_name": cq.from_user.full_name,
+        "tg_user_id": admin_user.id,
+        "tg_username": admin_user.username,
+        "tg_name": admin_user.full_name,
         "stock_id": stock["id"],
         "slot_key": stock["slot_key"],
         "app_name": stock["apps"]["name"],
@@ -2018,27 +1989,108 @@ async def cb_admin_paid_direct(update: Update, context: ContextTypes.DEFAULT_TYP
         "profile_name": stock.get("profile_name"),
         "profile_pin": stock.get("profile_pin"),
         "status": "success",
-        "paid_at": iso(now_dt),
-        "expires_at": iso(expires_at),
+        "paid_at": iso(t),
+        "expires_at": iso(t + timedelta(hours=stock["duration_hours"])),
     }
-    
     try:
         await dbx(sb.table("orders").insert(order))
-        await dbx(sb.table("stocks").update({"status": "rented", "held_until": None}).eq("slot_key", stock["slot_key"]))
-        
-        await safe_edit(cq, f"✅ <b>Akun berhasil dikeluarkan secara manual!</b>\nSlot <code>{h(stock['email'])}</code> telah ditandai sebagai disewa.")
-        
-        # Kirim langsung detail akun dengan tombol OTP (Order ID tidak akan nampil)
-        await context.bot.send_message(
-            cq.from_user.id,
-            delivery_text(order),
-            parse_mode=ParseMode.HTML,
-            reply_markup=delivery_markup(order)
+        await dbx(
+            sb.table("stocks")
+            .update({"status": "rented", "held_until": None})
+            .eq("slot_key", stock["slot_key"])
         )
-    except Exception as e:
-        logger.exception("Gagal admpaid direct")
+    except Exception:
+        logger.exception("issue_direct gagal")
         await release_slot(stock["slot_key"])
-        await cq.message.reply_text("❌ Gagal memproses data.")
+        return None
+    await bot.send_message(
+        admin_user.id, delivery_text(order),
+        parse_mode=ParseMode.HTML, reply_markup=delivery_markup(order),
+    )
+    return order
+
+
+async def paid_pick_by_email(update: Update, email: str):
+    rows = await dbx(
+        sb.table("stocks").select("*, apps(name)")
+        .eq("email", email).eq("status", "available").order("id")
+    )
+    if not rows:
+        return await update.message.reply_text(
+            f"❌ Tidak ada stok 'available' untuk email <b>{h(email)}</b>", parse_mode=ParseMode.HTML
+        )
+    kb = []
+    for r in rows:
+        prof = r.get("profile_name") or "Tanpa Profil"
+        kb.append([InlineKeyboardButton(
+            f"[{prof}] {r['label']} {r['duration_code']} - {rp(r['price'])}",
+            callback_data=f"admpaid:{r['id']}",
+        )])
+    kb.append([InlineKeyboardButton("❌ Batal", callback_data="ctos")])
+    await update.message.reply_text(
+        f"📦 <b>Stok Available:</b> <code>{h(email)}</code>\nPilih profil/durasi:",
+        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    a = context.args
+    if not a:
+        return await update.message.reply_text(PAID_USAGE, parse_mode=ParseMode.HTML)
+
+    # --- mode lama: /paid email ---
+    if "@" in a[0]:
+        return await paid_pick_by_email(update, a[0].lower())
+
+    # --- mode baru: /paid [app] label durasi ---
+    if len(a) == 2:
+        app_name, label, dur = None, a[0], a[1]
+    elif len(a) == 3:
+        app_name, label, dur = a
+    else:
+        return await update.message.reply_text(PAID_USAGE, parse_mode=ParseMode.HTML)
+
+    q = (
+        sb.table("stocks").select("id")
+        .eq("status", "available")
+        .ilike("label", label)
+        .eq("duration_code", dur.upper())
+        .order("id").limit(1)
+    )
+    if app_name:
+        found = await dbx(sb.table("apps").select("id").ilike("name", app_name))
+        if not found:
+            return await update.message.reply_text(f"❌ Aplikasi '{h(app_name)}' tidak ada.")
+        q = q.eq("app_id", found[0]["id"])
+
+    rows = await dbx(q)
+    if not rows:
+        return await update.message.reply_text(
+            f"❌ Tidak ada stok kosong untuk <b>{h(label.upper())} {h(dur.upper())}</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+    order = await issue_direct(context.bot, update.effective_user, rows[0]["id"])
+    if not order:
+        return await update.message.reply_text("❌ Stok baru saja diambil / gagal diproses, coba lagi.")
+    await update.message.reply_text(
+        f"✅ Dikeluarkan: <b>{h(order['app_name'])} {h(order['label'])} {h(order['duration_code'])}</b>\n"
+        f"📧 <code>{h(order['email'])}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cb_admin_paid_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    if cq.from_user.id not in OWNER_IDS:
+        return await cq.answer("Khusus admin.", show_alert=True)
+    sid = int(cq.data.split(":")[1])
+    order = await issue_direct(context.bot, cq.from_user, sid)
+    if not order:
+        return await cq.answer("❌ Stok baru saja diambil/tidak tersedia.", show_alert=True)
+    await cq.answer("Akun dikeluarkan ✅")
+    await safe_edit(cq, f"✅ Akun <code>{h(order['email'])}</code> berhasil dikeluarkan.")
 
 
 async def cmd_freestok(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2186,7 +2238,6 @@ async def admin_give_finish(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Kirim waktu lain atau /batal."
         )
 
-    # cek ulang stok (bisa saja berubah selama admin mengetik)
     rows = await dbx(sb.table("stocks").select("*, apps(name, need_otp)").eq("id", sid))
     if not rows or rows[0]["status"] != "available":
         context.user_data.pop("await", None)
@@ -2390,10 +2441,8 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif act in ("stock", "avail"):
         page = int(parts[2])
         
-        # Buat query dasar (tarik semua stok)
         q = sb.table("stocks").select("*, apps(name)").order("id", desc=True)
         
-        # Jika tombol yang ditekan adalah 'Stok Ready', tambahkan filter available
         if act == "avail":
             q = q.eq("status", "available")
             
@@ -2561,7 +2610,7 @@ async def main():
     app.add_handler(CommandHandler("addapp", cmd_addapp, filters=private))
     app.add_handler(CommandHandler("delstok", cmd_delstok, filters=private))
     app.add_handler(CommandHandler("edit", cmd_edit, filters=private))
-    app.add_handler(CommandHandler("paid", cmd_paid))
+    app.add_handler(CommandHandler("paid", cmd_paid, filters=private))
     app.add_handler(CommandHandler("freestok", cmd_freestok, filters=private))
     app.add_handler(CommandHandler("extend", cmd_extend, filters=private))
     app.add_handler(CommandHandler("give", cmd_give, filters=private))
@@ -2580,6 +2629,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(cb_admin_confirm, pattern=r"^admok:"))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^ad:"))
     app.add_handler(CallbackQueryHandler(cb_admin_paid_direct, pattern=r"^admpaid:"))
+    app.add_handler(CallbackQueryHandler(cb_ppj_done, pattern=r"^ppjok:\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & private, on_text))
     app.add_error_handler(on_error)
 
