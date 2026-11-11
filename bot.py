@@ -597,6 +597,8 @@ async def pick_and_hold(stock_id: int):
     if not rep:
         return None
     rep = rep[0]
+    
+    # 1. Ambil semua kandidat stok yang cocok (label, durasi, harga sama)
     cands = await dbx(
         sb.table("stocks")
         .select("*, apps(name, need_otp)")
@@ -607,15 +609,50 @@ async def pick_and_hold(stock_id: int):
         .eq("status", "available")
         .order("id")
     )
-    cands.sort(key=lambda r: r["id"] != stock_id)
+    
+    if not cands:
+        return None
+
+    # --- LOGIKA PRIORITAS AKUN MURNI (PURE) ---
+    cand_emails = list(set(c["email"] for c in cands))
+    
+    # Ambil semua stok available dari email-email kandidat ini untuk dianalisa
+    other_stocks = await dbx(
+        sb.table("stocks")
+        .select("email, label")
+        .eq("app_id", rep["app_id"])
+        .in_("email", cand_emails)
+        .eq("status", "available")
+    )
+    
+    # Kelompokkan label apa saja yang dimiliki oleh setiap email
+    email_labels = {}
+    for r in other_stocks:
+        email_labels.setdefault(r["email"], set()).add(r["label"].upper())
+        
+    req_label_upper = rep["label"].upper()
+    
+    def get_priority(c):
+        labels = email_labels.get(c["email"], set())
+        # Jika ada label lain selain yang dibeli (misal ada NOLIM), maka ini akun "campuran"
+        is_mixed = len(labels - {req_label_upper}) > 0
+        
+        # Urutan Prioritas Sorting:
+        # 1. is_mixed = False (Akun Murni didahulukan)
+        # 2. c["id"] != stock_id (ID yang persis diklik user didahulukan sedikit)
+        return (is_mixed, c["id"] != stock_id, c["id"])
+        
+    # Urutkan kandidat berdasarkan prioritas di atas
+    cands.sort(key=get_priority)
+    # -------------------------------------------
+
     until = iso(now() + timedelta(minutes=PAY_TIMEOUT_MIN + 1))
     
     for c in cands:
         # 1. Kunci baris spesifik ini dengan RPC (untuk mencegah race condition)
         ok = await dbx(sb.rpc("hold_slot", {"p_stock_id": c["id"], "p_until": until}))
         if ok:
-            # 2. [TAMBAHKAN BLOK INI] 
-            # Kunci JUGA semua stok lain yang slot_key-nya sama (termasuk label NOLIM / durasi lain)
+            # 2. Kunci JUGA semua stok lain yang slot_key-nya sama (termasuk label NOLIM / durasi lain)
             await dbx(
                 sb.table("stocks")
                 .update({"status": "held", "held_until": until})
@@ -773,29 +810,31 @@ def _body_text(msg) -> str:
 
 
 def _extract_code(text: str, device: str = "hp") -> str | None:
-    # Jika device TV, kita cari link dari Netflix atau kode 8 digit alfanumerik
+    # Logika untuk TV (link atau 8 digit alfanumerik)
     if device == "tv":
-        # Cari link
         links = re.findall(r"https?://[^\s\"'<>]+", text)
         for link in links:
             if "netflix.com" in link or "account" in link.lower():
-                return link  # Langsung return linknya
+                return link 
                 
-        # Cari kode 8 digit kombinasi huruf dan angka (biasanya kode TV)
         for m in re.finditer(r"(?<![\w-])([a-zA-Z0-9]{8})(?![\w-])", text):
             return m.group(1)
 
-    # Logika bawaan untuk HP/Laptop (cari 4-8 digit angka)
+    # Logika untuk HP/Laptop (STRICT 4 digit angka)
     text = re.sub(r"https?://\S+", " ", text)
     for marker in ("SRC:", "Ada pertanyaan", "Questions?", "Netflix Pte"):
         i = text.find(marker)
         if i > 0:
             text = text[:i]
-    for m in re.finditer(r"(?<![\w-])(\d{4,8})(?![\w-])", text):
+            
+    # Regex \d{4} memastikan HANYA mengambil angka yang panjangnya pas 4 digit
+    for m in re.finditer(r"(?<![\w-])(\d{4})(?![\w-])", text):
         c = m.group(1)
-        if len(c) == 4 and c[:2] in ("19", "20"):
+        # Abaikan jika terlihat seperti tahun kalender
+        if c[:2] in ("19", "20"):
             continue
         return c
+        
     return None
 
 
@@ -896,7 +935,7 @@ async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, origi
                 asyncio.create_task(auto_done_after(bot, oid, OTP_DONE_SEC))
             ACTIVE_OTP_LOCKS.pop(email, None)
             return
-        await asyncio.sleep(15)
+        await asyncio.sleep(3)
 
     ACTIVE_OTP_LOCKS.pop(email, None)
     try:
@@ -1669,6 +1708,8 @@ ADMIN_HELP = (
     "Perintah:\n"
     "<code>/addapp Nama</code> — tambah aplikasi\n"
     "<code>/delstok ID</code> — hapus stok (hanya yg tersedia)\n"
+    "<code>/disable EMAIL</code> — bekukan akun/email sementara\n"
+    "<code>/enable EMAIL</code> — aktifkan kembali akun/email\n"
     "<code>/edit ID field nilai</code> — field: price, label, durasi, password, pin, mailpw\n"
     "<code>/paid EMAIL</code> — list stok & keluarkan akun instan (bypass bayar)\n"
     "<code>/extend ORDER_ID Durasi</code> — ubah jadwal expires (cth: 1D, 2J, -12H)\n"
@@ -1790,6 +1831,72 @@ async def cmd_addapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await dbx(sb.table("apps").insert({"name": name}))
     await update.message.reply_text(f"✅ Aplikasi <b>{h(name)}</b> ditambahkan.", parse_mode=ParseMode.HTML)
 
+
+async def cmd_disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ <b>Format Salah</b>\nGunakan: <code>/disable email@gmail.com</code>", 
+            parse_mode=ParseMode.HTML
+        )
+    
+    email = context.args[0].lower()
+    
+    # Ubah stok yang tersedia (available) menjadi 'disabled'
+    rows = await dbx(
+        sb.table("stocks")
+        .update({"status": "disabled"})
+        .eq("email", email)
+        .eq("status", "available")
+    )
+    
+    if not rows:
+        # Cek apakah emailnya ada di database tapi sedang disewa
+        exist = await dbx(sb.table("stocks").select("id").eq("email", email))
+        if exist:
+            return await update.message.reply_text(
+                f"⚠️ Email <b>{h(email)}</b> ditemukan, tapi tidak ada slot yang sedang 'available'. "
+                "Kemungkinan sedang disewa atau di-hold pembeli.", 
+                parse_mode=ParseMode.HTML
+            )
+        return await update.message.reply_text("❌ Email tidak ditemukan di database stok.")
+        
+    await update.message.reply_text(
+        f"✅ <b>{len(rows)}</b> slot untuk email <b>{h(email)}</b> berhasil dinonaktifkan sementara.\n"
+        f"<i>(Tidak akan muncul di katalog pembeli)</i>", 
+        parse_mode=ParseMode.HTML
+    )
+
+async def cmd_enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    if not context.args:
+        return await update.message.reply_text(
+            "⚠️ <b>Format Salah</b>\nGunakan: <code>/enable email@gmail.com</code>", 
+            parse_mode=ParseMode.HTML
+        )
+    
+    email = context.args[0].lower()
+    
+    # Kembalikan stok yang 'disabled' menjadi 'available'
+    rows = await dbx(
+        sb.table("stocks")
+        .update({"status": "available"})
+        .eq("email", email)
+        .eq("status", "disabled")
+    )
+    
+    if not rows:
+        return await update.message.reply_text(
+            f"❌ Tidak ada slot dengan status 'disabled' untuk email <b>{h(email)}</b>.", 
+            parse_mode=ParseMode.HTML
+        )
+        
+    await update.message.reply_text(
+        f"✅ <b>{len(rows)}</b> slot untuk email <b>{h(email)}</b> diaktifkan kembali dan siap disewa.", 
+        parse_mode=ParseMode.HTML
+    )
 
 async def cmd_delstok(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
