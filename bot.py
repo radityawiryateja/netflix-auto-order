@@ -835,13 +835,15 @@ def _extract_code(text: str, device: str = "hp") -> str | None:
     return None
 
 
-def fetch_otp_sync(mail_user: str, app_password: str, since_dt: datetime, device: str = "hp") -> str | None:
-    m = imaplib.IMAP4_SSL("imap.gmail.com")
+def fetch_otp_sync(m: imaplib.IMAP4_SSL, since_dt: datetime, device: str = "hp") -> str | None:
+    """Fungsi ini sekarang hanya melakukan FETCH, koneksi diurus di luar agar tidak spam login"""
     try:
-        m.login(mail_user, app_password.replace(" ", ""))
         m.select("INBOX", readonly=True)
-        typ, data = m.search(None, "X-GM-RAW", '"newer_than:1d"')
+        # Ambil semua email, jangan pakai X-GM-RAW agar instan tanpa nunggu indexing Google
+        typ, data = m.search(None, "ALL")
         ids = data[0].split() if data and data[0] else []
+        
+        # Cek 5 email terakhir saja
         for mid in reversed(ids[-5:]):
             typ, md = m.fetch(mid, "(RFC822)")
             msg = pyemail.message_from_bytes(md[0][1])
@@ -849,87 +851,116 @@ def fetch_otp_sync(mail_user: str, app_password: str, since_dt: datetime, device
                 dt = parsedate_to_datetime(msg["Date"])
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-                if dt < since_dt:
+                
+                # Tambahkan buffer 2 menit mundur untuk toleransi jam server yang tidak sinkron
+                safe_since = since_dt - timedelta(minutes=2)
+                if dt < safe_since:
                     continue
             except Exception:
                 pass
+            
             subject = str(make_header(decode_header(msg.get("Subject", ""))))
             code = _extract_code(subject, device) or _extract_code(_body_text(msg), device)
             if code:
                 return code
         return None
+    except Exception as e:
+        logger.error(f"IMAP Fetch Error: {e}")
+        return None
+
+
+async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, original_msg, status_msg, device: str = "hp"):
+    email_acc = order["email"]
+    oid = order["id"]
+    timeout_minutes = 5
+    end_time = since_dt + timedelta(minutes=timeout_minutes)
+    
+    code = None
+    
+    # 1. Buka 1 Koneksi IMAP untuk dipakai berulang (mencegah Google block spam login)
+    try:
+        m = imaplib.IMAP4_SSL("imap.gmail.com")
+        m.login(email_acc, app_pw.replace(" ", ""))
+    except Exception as e:
+        logger.error(f"Gagal login IMAP untuk {email_acc}: {e}")
+        ACTIVE_OTP_LOCKS.pop(email_acc, None)
+        return
+
+    try:
+        # Loop berdasarkan waktu 5 menit sebenarnya, bukan range loop
+        while now() < end_time:
+            time_left = end_time - now()
+            mins, secs = divmod(int(time_left.total_seconds()), 60)
+            timer_str = f"{mins:02d}:{secs:02d}"
+            
+            device_name = "TV 📺" if device == "tv" else "HP/Laptop 📱"
+            live_text = f"⏳ <b>Menunggu Kode {device_name} ({timer_str})</b>\n\nBot sedang memantau email secara live..."
+            
+            # Update UI timer (skip jika API telegram limit)
+            if secs % 10 == 0:  # Update pesan tiap 10 detik agar tidak kena limit Telegram
+                try:
+                    await bot.edit_message_text(
+                        chat_id=order["tg_user_id"],
+                        message_id=status_msg.message_id,
+                        text=live_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                    
+            # Tarik kode via thread
+            code = await asyncio.to_thread(fetch_otp_sync, m, since_dt, device)
+            
+            if code:
+                break
+                
+            await asyncio.sleep(5)  # Cek inbox tiap 5 detik (aman & responsif)
+
     finally:
         try:
             m.logout()
         except Exception:
             pass
 
-
-async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, original_msg, status_msg, device: str = "hp"):
-    email = order["email"]
-    oid = order["id"]
-    for _ in range(20):
-        time_left = (since_dt + timedelta(minutes=5)) - now()
-        if time_left.total_seconds() <= 0:
-            break
-        mins, secs = divmod(int(time_left.total_seconds()), 60)
-        timer_str = f"{mins:02d}:{secs:02d}"
-        
-        device_name = "TV 📺" if device == "tv" else "HP/Laptop 📱"
-        live_text = f"⏳ <b>Menunggu Kode {device_name} ({timer_str})</b>\n\nBot sedang memantau email secara live..."
-        
-        try:
-            await bot.edit_message_text(
-                chat_id=order["tg_user_id"],
-                message_id=status_msg.message_id,
-                text=live_text,
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
-            
-        try:
-            code = await asyncio.to_thread(fetch_otp_sync, email, app_pw, since_dt, device)
-        except Exception as e:
-            logger.error(f"Error saat polling OTP: {e}")
-            code = None
-            
-        if code:
-            claimed = await dbx(
-                sb.table("orders")
-                .update({"otp_used": True, "otp_code": code})
-                .eq("id", oid)
-                .eq("otp_used", False)
-            )
-            if claimed:
-                try:
-                    await bot.edit_message_text(
-                        chat_id=order["tg_user_id"],
-                        message_id=status_msg.message_id,
-                        text=T("otp_poll_done"),
-                        parse_mode=ParseMode.HTML,
-                    )
+    # -- LOGIKA JIKA KODE DITEMUKAN / TIMEOUT --
+    if code:
+        claimed = await dbx(
+            sb.table("orders")
+            .update({"otp_used": True, "otp_code": code})
+            .eq("id", oid)
+            .eq("otp_used", False)
+        )
+        if claimed:
+            try:
+                await bot.edit_message_text(
+                    chat_id=order["tg_user_id"],
+                    message_id=status_msg.message_id,
+                    text=T("otp_poll_done"),
+                    parse_mode=ParseMode.HTML,
+                )
+                
+                if code.startswith("http"):
+                    success_msg = f"✅ <b>Link Konfirmasi Didapatkan!</b>\n\n🔗 Klik link berikut untuk masuk: \n{code}\n\n<i>Kesempatan 1x sudah terpakai.</i>"
+                else:
+                    success_msg = T("otp_success", code=h(code))
                     
-                    if code.startswith("http"):
-                        success_msg = f"✅ <b>Link Konfirmasi Didapatkan!</b>\n\n🔗 Klik link berikut untuk masuk: \n{code}\n\n<i>Kesempatan 1x sudah terpakai.</i>"
-                    else:
-                        success_msg = T("otp_success", code=h(code))
-                        
-                    await bot.send_message(
-                        order["tg_user_id"],
-                        success_msg,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True
-                    )
-                except Exception:
-                    pass
-                await notify_admin(bot, f"🔑 OTP/Link dikirim | <code>{oid}</code> | <code>{h(email)}</code>")
-                asyncio.create_task(auto_done_after(bot, oid, OTP_DONE_SEC))
-            ACTIVE_OTP_LOCKS.pop(email, None)
-            return
-        await asyncio.sleep(3)
+                await bot.send_message(
+                    order["tg_user_id"],
+                    success_msg,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True
+                )
+            except Exception:
+                pass
+            
+            await notify_admin(bot, f"🔑 OTP/Link dikirim | <code>{oid}</code> | <code>{h(email_acc)}</code>")
+            asyncio.create_task(auto_done_after(bot, oid, OTP_DONE_SEC))
+            
+        ACTIVE_OTP_LOCKS.pop(email_acc, None)
+        return
 
-    ACTIVE_OTP_LOCKS.pop(email, None)
+    # Jika loop selesai dan code masih None = Timeout
+    ACTIVE_OTP_LOCKS.pop(email_acc, None)
     try:
         await bot.edit_message_text(
             chat_id=order["tg_user_id"],
@@ -937,10 +968,6 @@ async def poll_otp_task(bot, order: dict, app_pw: str, since_dt: datetime, origi
             text=T("otp_timeout_title"),
             parse_mode=ParseMode.HTML,
         )
-    except Exception:
-        pass
-
-    try:
         await bot.send_message(
             order["tg_user_id"], T("otp_timeout_body"), parse_mode=ParseMode.HTML
         )
