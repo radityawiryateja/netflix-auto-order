@@ -1765,6 +1765,41 @@ async def cmd_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     email = context.args[0].lower()
+    text, markup = await render_cek_message(email)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def cb_admin_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    if cq.from_user.id not in OWNER_IDS:
+        return await cq.answer("Khusus admin.", show_alert=True)
+        
+    parts = cq.data.split(":")
+    sid = int(parts[1])
+    action = parts[2] # 'en' atau 'dis'
+    
+    rows = await dbx(sb.table("stocks").select("email, status").eq("id", sid))
+    if not rows:
+        return await cq.answer("Stok tidak ditemukan", show_alert=True)
+        
+    stock = rows[0]
+    email = stock["email"]
+    
+    if action == "dis" and stock["status"] == "available":
+        await dbx(sb.table("stocks").update({"status": "disabled"}).eq("id", sid))
+        await cq.answer("Slot berhasil di-disable 🔴")
+    elif action == "en" and stock["status"] == "disabled":
+        await dbx(sb.table("stocks").update({"status": "available"}).eq("id", sid))
+        await cq.answer("Slot berhasil di-enable 🟢")
+    else:
+        await cq.answer("Status slot sudah berubah, toggle dibatalkan.", show_alert=True)
+        
+    # Refresh pesan /cek secara langsung
+    text, markup = await render_cek_message(email)
+    await safe_edit(cq, text, markup)
+
+async def render_cek_message(email: str):
+    # 1. Ambil data stok
     rows = await dbx(
         sb.table("stocks")
         .select("id, status, label, duration_code, price, profile_name, ppj_start, apps(name)")
@@ -1773,22 +1808,57 @@ async def cmd_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     if not rows:
-        return await update.message.reply_text(
-            f"❌ Tidak ada stok untuk email <b>{h(email)}</b>", 
-            parse_mode=ParseMode.HTML
-        )
-    
+        return f"❌ Tidak ada stok untuk email <b>{h(email)}</b>", None
+
+    # 2. Cek order aktif untuk mencari tau ID stok mana yang BENAR-BENAR sedang ditransaksikan
+    active_orders = await dbx(
+        sb.table("orders")
+        .select("stock_id, status")
+        .eq("email", email)
+        .in_("status", ["pending", "success", "gift"])
+    )
+    # Buat dictionary pemetaan {id_stok: status_ordernya}
+    active_stock_ids = {o["stock_id"]: o["status"] for o in active_orders}
+        
     lines = [f"🔍 <b>Stok untuk:</b> <code>{h(email)}</code>\n"]
-    icon = {"available": "🟢", "held": "🟡", "rented": "🔴"}
     
+    kb = []
     for s in rows:
         prof = f" | 👤 {h(s['profile_name'])}" if s.get("profile_name") else ""
+        
+        # Penentuan Warna / Ikon
+        if s["id"] in active_stock_ids:
+            order_status = active_stock_ids[s["id"]]
+            if order_status == "pending":
+                icon = "🕐"  # Sedang pending payment
+            else:
+                icon = "🔵"  # Ini durasi aslinya yang sedang AKTI disewa
+        else:
+            if s['status'] == 'available':
+                icon = "🟢"
+            elif s['status'] == 'held':
+                icon = "🟡"
+            elif s['status'] == 'rented':
+                icon = "🔴"  # Ini durasi lain di profil yg sama (ikut terkunci)
+            elif s['status'] == 'disabled':
+                icon = "⚫️"
+            else:
+                icon = "⚪"
+
         lines.append(
-            f"{icon.get(s['status'], '⚪')} <code>#{s['id']}</code> {h(s['apps']['name'])} {h(s['label'])} "
+            f"{icon} <code>#{s['id']}</code> {h(s['apps']['name'])} {h(s['label'])} "
             f"({h(s['duration_code'])}) - {rp(s['price'])}{prof}"
         )
         
-    lines.append("\n🟢 tersedia  🟡 di-hold  🔴 disewa")
+        # Tambahkan tombol berdasarkan status slot
+        prof_name = f" {s.get('profile_name')}" if s.get("profile_name") else ""
+        if s['status'] == 'available':
+            kb.append([InlineKeyboardButton(f"🔴 Disable #{s['id']}{prof_name}", callback_data=f"admtgl:{s['id']}:dis")])
+        elif s['status'] == 'disabled':
+            kb.append([InlineKeyboardButton(f"🟢 Enable #{s['id']}{prof_name}", callback_data=f"admtgl:{s['id']}:en")])
+
+    # Update keterangan legenda warna
+    lines.append("\n🟢 ready  🟡 hold  🔴 slot terkunci  🔵 disewa aktif  🕐 pending  ⚫️ disabled")
 
     # Status PPJ
     ppj = next((s["ppj_start"] for s in rows if s.get("ppj_start")), None)
@@ -1796,8 +1866,7 @@ async def cmd_cek(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day = (now() - parse_dt(ppj)).days
         lines.append(f"\n📆 PPJ terakhir: {fmt_dt(ppj)} (hari ke-{day}/{PPJ_CYCLE_DAYS})")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
+    return "\n".join(lines), InlineKeyboardMarkup(kb) if kb else None
 
 async def cmd_bc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update):
@@ -1986,7 +2055,8 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 PAID_USAGE = (
     "Format <code>/paid</code>:\n"
     "• <code>/paid 1p1u 1d</code> → ambil stok kosong label 1P1U durasi 1D\n"
-    "• <code>/paid netflix 1p1u 1d</code> → sama, tapi tentukan aplikasi\n"
+    "• <code>/paid netflix 1p1u 1d</code> → sama, tentukan aplikasi\n"
+    "• <code>/paid netflix profil 1 1p1u 1d</code> → tembak spesifik ke nama profil tertentu\n"
     "• <code>/paid email@gmail.com</code> → pilih manual dari 1 email"
 )
 
@@ -2071,13 +2141,18 @@ async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "@" in a[0]:
         return await paid_pick_by_email(update, a[0].lower())
 
-    # --- mode baru: /paid [app] label durasi ---
+    # --- mode baru: /paid [app] [namaprofil] label durasi ---
+    app_name, profile_name, label, dur = None, None, None, None
+
     if len(a) == 2:
-        app_name, label, dur = None, a[0], a[1]
+        label, dur = a[0], a[1]
     elif len(a) == 3:
-        app_name, label, dur = a
-    else:
-        return await update.message.reply_text(PAID_USAGE, parse_mode=ParseMode.HTML)
+        app_name, label, dur = a[0], a[1], a[2]
+    elif len(a) >= 4:
+        app_name = a[0]             # Kata pertama = Aplikasi
+        dur = a[-1]                 # Kata terakhir = Durasi
+        label = a[-2]               # Kata kedua dari belakang = Label
+        profile_name = " ".join(a[1:-2])  # Sisanya di tengah = Nama Profil (mendukung spasi)
 
     q = (
         sb.table("stocks").select("id")
@@ -2086,23 +2161,36 @@ async def cmd_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         .eq("duration_code", dur.upper())
         .order("id").limit(1)
     )
+    
     if app_name:
         found = await dbx(sb.table("apps").select("id").ilike("name", app_name))
         if not found:
             return await update.message.reply_text(f"❌ Aplikasi '{h(app_name)}' tidak ada.")
         q = q.eq("app_id", found[0]["id"])
+        
+    if profile_name:
+        # Case insensitive pencarian profil menggunakan ilike
+        q = q.ilike("profile_name", profile_name)
 
     rows = await dbx(q)
     if not rows:
+        if profile_name:
+            return await update.message.reply_text(
+                f"❌ Tidak ada stok kosong untuk Profil <b>{h(profile_name)}</b> - <b>{h(label.upper())} {h(dur.upper())}</b>.",
+                parse_mode=ParseMode.HTML,
+            )
         return await update.message.reply_text(
             f"❌ Tidak ada stok kosong untuk <b>{h(label.upper())} {h(dur.upper())}</b>.",
             parse_mode=ParseMode.HTML,
         )
+        
     order = await issue_direct(context.bot, update.effective_user, rows[0]["id"])
     if not order:
         return await update.message.reply_text("❌ Stok baru saja diambil / gagal diproses, coba lagi.")
+        
+    prof_text = f" [Profil: {h(order.get('profile_name') or '-')}]"
     await update.message.reply_text(
-        f"✅ Dikeluarkan: <b>{h(order['app_name'])} {h(order['label'])} {h(order['duration_code'])}</b>\n"
+        f"✅ Dikeluarkan: <b>{h(order['app_name'])} {h(order['label'])} {h(order['duration_code'])}</b>{prof_text}\n"
         f"📧 <code>{h(order['email'])}</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -2653,6 +2741,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(cb_otp_select, pattern=r"^otpsel:"))
     app.add_handler(CallbackQueryHandler(cb_done, pattern=r"^done:"))
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help:"))
+    app.add_handler(CallbackQueryHandler(cb_admin_toggle, pattern=r"^admtgl:"))
     app.add_handler(CallbackQueryHandler(cb_admin_confirm, pattern=r"^admok:"))
     app.add_handler(CallbackQueryHandler(cb_admin, pattern=r"^ad:"))
     app.add_handler(CallbackQueryHandler(cb_admin_paid_direct, pattern=r"^admpaid:"))
